@@ -1,4 +1,4 @@
-name: Homebrewing-the-tweak
+name: Burning the tweak
 
 on:
   workflow_dispatch:
