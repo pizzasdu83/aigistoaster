@@ -90,7 +90,7 @@ static UIImage *AGTBlur(UIImage *img, CGFloat amount) {
 
 // Samples a 3x3 grid of colors (row-major, top-left first).
 static NSArray<UIColor *> *AGTSampleGrid(UIImage *img) {
-    const int N = 3;
+    enum { N = 3 };
     uint8_t px[N * N * 4];
     memset(px, 0, sizeof(px));
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
