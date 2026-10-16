@@ -8,7 +8,7 @@
 #define YTM_BUNDLE_ID @"com.google.ios.youtubemusic"
 
 // ---------------------------------------------------------------------------
-// MediaRemote (private) loaded dynamically
+// MediaRemote (private), loaded dynamically
 // ---------------------------------------------------------------------------
 typedef void (^MRInfoBlock)(CFDictionaryRef info);
 typedef void (^MRIDBlock)(CFStringRef appID);
@@ -41,7 +41,7 @@ static CGFloat AGTFloat(NSString *key, CGFloat def) {
 
 static NSString *AGTString(NSString *key, NSString *def) {
     id v = [AGTPrefs() objectForKey:key];
-    return [v isKindOfClass:[NSString class]] ? v : def;
+    return ([v isKindOfClass:[NSString class]] && [v length]) ? v : def;
 }
 
 static UIColor *AGTColorFromHex(NSString *hex) {
@@ -55,7 +55,7 @@ static UIColor *AGTColorFromHex(NSString *hex) {
 }
 
 // ---------------------------------------------------------------------------
-// Image helpers
+// Image helpers (all safe to call off the main thread)
 // ---------------------------------------------------------------------------
 static UIImage *AGTDownscale(UIImage *img, CGFloat maxSide) {
     CGSize sz = img.size;
@@ -71,12 +71,12 @@ static UIImage *AGTDownscale(UIImage *img, CGFloat maxSide) {
 }
 
 static UIImage *AGTBlur(UIImage *img, CGFloat amount) {
-    UIImage *small = AGTDownscale(img, 160);
+    UIImage *small = AGTDownscale(img, 120);
     CIImage *ci = [CIImage imageWithCGImage:small.CGImage];
     if (!ci) return img;
     CIFilter *f = [CIFilter filterWithName:@"CIGaussianBlur"];
     [f setValue:[ci imageByClampingToExtent] forKey:kCIInputImageKey];
-    [f setValue:@(amount * 0.25) forKey:kCIInputRadiusKey]; // amount 0-100 -> radius 0-25
+    [f setValue:@(amount * 0.2) forKey:kCIInputRadiusKey]; // 0-100 -> radius 0-20 (on a 120px image)
     CIImage *out = [f.outputImage imageByCroppingToRect:ci.extent];
     static CIContext *cictx;
     static dispatch_once_t once;
@@ -88,7 +88,7 @@ static UIImage *AGTBlur(UIImage *img, CGFloat amount) {
     return res;
 }
 
-// Samples a 3x3 grid of colors (row-major, top-left first).
+// 3x3 grid of colors (row-major, top-left first)
 static NSArray<UIColor *> *AGTSampleGrid(UIImage *img) {
     enum { N = 3 };
     uint8_t px[N * N * 4];
@@ -117,15 +117,55 @@ static NSArray<UIColor *> *AGTSampleGrid(UIImage *img) {
     return colors;
 }
 
+// Mesh rendered ONCE into a tiny bitmap; the GPU only ever draws a static
+// texture afterwards (no live gradients, no per-frame cost).
+static UIImage *AGTRenderMesh(UIImage *art) {
+    NSArray<UIColor *> *colors = AGTSampleGrid(art);
+    if (colors.count != 9) return nil;
+
+    CGSize size = CGSizeMake(90, 195);
+    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
+    fmt.scale = 1;
+    fmt.opaque = YES;
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:size format:fmt];
+
+    return [r imageWithActions:^(UIGraphicsImageRendererContext *rc) {
+        CGContextRef c = rc.CGContext;
+
+        CGFloat ar = 0, ag = 0, ab = 0, a;
+        for (UIColor *col in colors) {
+            CGFloat cr, cg, cb;
+            [col getRed:&cr green:&cg blue:&cb alpha:&a];
+            ar += cr; ag += cg; ab += cb;
+        }
+        CGContextSetRGBFillColor(c, ar / 9, ag / 9, ab / 9, 1);
+        CGContextFillRect(c, CGRectMake(0, 0, size.width, size.height));
+
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGFloat radius = size.height * 0.45;
+        for (int i = 0; i < 9; i++) {
+            CGFloat cr, cg, cb;
+            [colors[i] getRed:&cr green:&cg blue:&cb alpha:&a];
+            CGFloat comps[8] = {cr, cg, cb, 1.0, cr, cg, cb, 0.0};
+            CGGradientRef grad = CGGradientCreateWithColorComponents(cs, comps, NULL, 2);
+            CGPoint ctr = CGPointMake(((i % 3) + 0.5) / 3.0 * size.width,
+                                      ((i / 3) + 0.5) / 3.0 * size.height);
+            CGContextDrawRadialGradient(c, grad, ctr, 0, ctr, radius, 0);
+            CGGradientRelease(grad);
+        }
+        CGColorSpaceRelease(cs);
+    }];
+}
+
 // ---------------------------------------------------------------------------
 // Background view
 // ---------------------------------------------------------------------------
 @interface AGTBackgroundView : UIView
 @property (nonatomic, strong) CAGradientLayer *gradientLayer;
 @property (nonatomic, strong) UIImageView *imageView;
-@property (nonatomic, strong) UIView *meshContainer;
 @property (nonatomic, strong) UIView *dimView;
-- (void)applyWithArtwork:(UIImage *)art;
+@property (nonatomic, copy) NSString *signature;
+- (void)applyWithArtwork:(UIImage *)art artHash:(NSUInteger)hash;
 @end
 
 @implementation AGTBackgroundView
@@ -138,16 +178,14 @@ static NSArray<UIColor *> *AGTSampleGrid(UIImage *img) {
 
         _gradientLayer = [CAGradientLayer layer];
         _gradientLayer.frame = self.bounds;
+        _gradientLayer.hidden = YES;
         [self.layer addSublayer:_gradientLayer];
 
         _imageView = [[UIImageView alloc] initWithFrame:self.bounds];
         _imageView.contentMode = UIViewContentModeScaleAspectFill;
         _imageView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        _imageView.hidden = YES;
         [self addSubview:_imageView];
-
-        _meshContainer = [[UIView alloc] initWithFrame:self.bounds];
-        _meshContainer.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        [self addSubview:_meshContainer];
 
         _dimView = [[UIView alloc] initWithFrame:self.bounds];
         _dimView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -165,82 +203,63 @@ static NSArray<UIColor *> *AGTSampleGrid(UIImage *img) {
     [CATransaction commit];
 }
 
-- (void)applyWithArtwork:(UIImage *)art {
+- (void)showImage:(UIImage *)img animated:(BOOL)animated {
+    self.imageView.image = img;
+    self.imageView.hidden = NO;
+    self.gradientLayer.hidden = YES;
+    [self.imageView.layer removeAnimationForKey:@"drift"];
+    if (animated) {
+        // One single layer, one slow transform: very cheap compared to many live gradients.
+        CABasicAnimation *an = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+        an.fromValue = @1.0;
+        an.toValue = @1.2;
+        an.duration = 20.0;
+        an.autoreverses = YES;
+        an.repeatCount = HUGE_VALF;
+        an.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+        [self.imageView.layer addAnimation:an forKey:@"drift"];
+    }
+}
+
+- (void)applyWithArtwork:(UIImage *)art artHash:(NSUInteger)hash {
     NSString *mode = AGTString(@"mode", @"mesh"); // gradient | mesh | blur
     if (!art && ![mode isEqualToString:@"gradient"]) mode = @"gradient";
 
-    self.gradientLayer.hidden = YES;
-    self.imageView.hidden = YES;
-    self.meshContainer.hidden = YES;
-    [self.meshContainer.subviews makeObjectsPerformSelector:@selector(removeFromSuperview)];
-    self.dimView.alpha = AGTFloat(@"dim", 0.25);
+    CGFloat dim = AGTFloat(@"dim", 0.25);
+    NSString *c1 = AGTString(@"gradientColor1", @"#FF0050");
+    NSString *c2 = AGTString(@"gradientColor2", @"#7000FF");
+    CGFloat angle = AGTFloat(@"gradientAngle", 135);
+    CGFloat blur = AGTFloat(@"blurAmount", 60);
+    BOOL anim = AGTBool(@"meshAnimated", NO);
+    BOOL isGradient = [mode isEqualToString:@"gradient"];
 
-    if ([mode isEqualToString:@"gradient"]) {
-        NSString *list = AGTString(@"gradientColors", @"#FF0050,#7000FF");
-        NSMutableArray *cgColors = [NSMutableArray array];
-        for (NSString *hex in [list componentsSeparatedByString:@","]) {
-            if (hex.length) [cgColors addObject:(id)AGTColorFromHex(hex).CGColor];
-        }
-        if (cgColors.count < 2) {
-            cgColors = [NSMutableArray arrayWithObjects:(id)AGTColorFromHex(@"#FF0050").CGColor,
-                                                       (id)AGTColorFromHex(@"#7000FF").CGColor, nil];
-        }
-        CGFloat rad = AGTFloat(@"gradientAngle", 135) * M_PI / 180.0;
-        self.gradientLayer.colors = cgColors;
+    NSString *sig = [NSString stringWithFormat:@"%@|%.2f|%@|%@|%.0f|%.0f|%d|%lu",
+                     mode, dim, c1, c2, angle, blur, anim, (unsigned long)(isGradient ? 0 : hash)];
+    if ([sig isEqualToString:self.signature]) return; // nothing changed: do no work at all
+    self.signature = sig;
+    self.dimView.alpha = dim;
+
+    if (isGradient) {
+        CGFloat rad = angle * M_PI / 180.0;
+        self.gradientLayer.colors = @[(id)AGTColorFromHex(c1).CGColor, (id)AGTColorFromHex(c2).CGColor];
         self.gradientLayer.startPoint = CGPointMake(0.5 - cos(rad) / 2, 0.5 - sin(rad) / 2);
         self.gradientLayer.endPoint = CGPointMake(0.5 + cos(rad) / 2, 0.5 + sin(rad) / 2);
         self.gradientLayer.hidden = NO;
+        self.imageView.hidden = YES;
+        [self.imageView.layer removeAnimationForKey:@"drift"];
         return;
     }
 
-    if ([mode isEqualToString:@"blur"]) {
-        self.imageView.image = AGTBlur(art, AGTFloat(@"blurAmount", 60));
-        self.imageView.hidden = NO;
-        return;
-    }
-
-    // mesh
-    NSArray<UIColor *> *colors = AGTSampleGrid(art);
-    if (colors.count != 9) return;
-
-    CGRect b = self.bounds;
-    if (CGRectIsEmpty(b)) b = UIScreen.mainScreen.bounds;
-
-    CGFloat r = 0, g = 0, bl = 0, a;
-    for (UIColor *c in colors) {
-        CGFloat cr, cg, cb;
-        [c getRed:&cr green:&cg blue:&cb alpha:&a];
-        r += cr; g += cg; bl += cb;
-    }
-    self.meshContainer.backgroundColor = [UIColor colorWithRed:r / 9 green:g / 9 blue:bl / 9 alpha:1];
-    self.meshContainer.frame = b;
-
-    CGFloat diameter = MAX(b.size.width, b.size.height) * 0.75;
-    for (int i = 0; i < 9; i++) {
-        int col = i % 3, row = i / 3;
-        CGPoint center = CGPointMake((col + 0.5) / 3.0 * b.size.width,
-                                     (row + 0.5) / 3.0 * b.size.height);
-        CAGradientLayer *blob = [CAGradientLayer layer];
-        blob.type = kCAGradientLayerRadial;
-        blob.colors = @[(id)colors[i].CGColor, (id)[colors[i] colorWithAlphaComponent:0].CGColor];
-        blob.startPoint = CGPointMake(0.5, 0.5);
-        blob.endPoint = CGPointMake(1, 1);
-        blob.bounds = CGRectMake(0, 0, diameter, diameter);
-        blob.position = center;
-        [self.meshContainer.layer addSublayer:blob];
-
-        if (AGTBool(@"meshAnimated", YES)) {
-            CABasicAnimation *an = [CABasicAnimation animationWithKeyPath:@"position"];
-            an.fromValue = [NSValue valueWithCGPoint:CGPointMake(center.x - 40, center.y - 30)];
-            an.toValue = [NSValue valueWithCGPoint:CGPointMake(center.x + 40, center.y + 30)];
-            an.duration = 6.0 + i;
-            an.autoreverses = YES;
-            an.repeatCount = HUGE_VALF;
-            an.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
-            [blob addAnimation:an forKey:@"drift"];
-        }
-    }
-    self.meshContainer.hidden = NO;
+    BOOL isBlur = [mode isEqualToString:@"blur"];
+    __weak AGTBackgroundView *weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        UIImage *result = isBlur ? AGTBlur(art, blur) : AGTRenderMesh(art);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            AGTBackgroundView *s = weakSelf;
+            if (!s || !result || ![s.signature isEqualToString:sig]) return; // outdated
+            [s showImage:result animated:(!isBlur && anim)];
+        });
+    });
 }
 
 @end
@@ -250,12 +269,19 @@ static NSArray<UIColor *> *AGTSampleGrid(UIImage *img) {
 // ---------------------------------------------------------------------------
 static AGTBackgroundView *gView;
 static UIImage *gArt;
+static NSUInteger gArtHash;
 static BOOL gActive;
+static BOOL gVisible;
+static NSUInteger gGen;
 
 static void AGTPresent(void) {
     if (!gView) return;
-    if (gActive) [gView applyWithArtwork:gArt];
-    [UIView animateWithDuration:0.6 animations:^{ gView.alpha = gActive ? 1.0 : 0.0; }];
+    BOOL on = gActive && AGTBool(@"enabled", YES);
+    if (on && gVisible) [gView applyWithArtwork:gArt artHash:gArtHash];
+    CGFloat target = on ? 1.0 : 0.0;
+    if (gView.alpha != target) {
+        [UIView animateWithDuration:0.6 animations:^{ gView.alpha = target; }];
+    }
 }
 
 static void AGTSetActive(BOOL on) {
@@ -264,7 +290,10 @@ static void AGTSetActive(BOOL on) {
 }
 
 static void AGTRefresh(void) {
+    if (!gVisible) return; // lockscreen not shown: do nothing (refreshed on next appear)
     if (!MRGetAppID || !MRGetPlaying || !MRGetInfo) return;
+    if (!AGTBool(@"enabled", YES)) { AGTSetActive(NO); return; }
+
     dispatch_queue_t q = dispatch_get_main_queue();
     MRGetAppID(q, ^(CFStringRef appID) {
         NSString *bid = (__bridge NSString *)appID;
@@ -280,15 +309,32 @@ static void AGTRefresh(void) {
             MRGetInfo(q, ^(CFDictionaryRef info) {
                 NSDictionary *d = (__bridge NSDictionary *)info;
                 NSData *data = d[@"kMRMediaRemoteNowPlayingInfoArtworkData"];
-                gArt = data ? [UIImage imageWithData:data] : nil;
+                NSUInteger h = data ? (data.length * 31u + data.hash) : 0;
+                if (h != gArtHash || (!gArt && data)) { // only decode when the artwork really changed
+                    gArt = data ? [UIImage imageWithData:data] : nil;
+                    gArtHash = h;
+                }
                 AGTSetActive(YES);
             });
         });
     });
 }
 
+// MediaRemote fires a lot of notifications (elapsed time, etc.): coalesce them.
+static void AGTScheduleRefresh(void) {
+    NSUInteger gen = ++gGen;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (gen == gGen) AGTRefresh();
+    });
+}
+
 static void AGTPrefsChanged(CFNotificationCenterRef c, void *o, CFStringRef n, const void *obj, CFDictionaryRef u) {
-    dispatch_async(dispatch_get_main_queue(), ^{ AGTPresent(); });
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!AGTBool(@"enabled", YES)) { AGTSetActive(NO); return; }
+        AGTScheduleRefresh();
+        AGTPresent();
+    });
 }
 
 static void AGTAttach(UIView *host) {
@@ -317,8 +363,14 @@ static void AGTAttach(UIView *host) {
 
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
+    gVisible = YES;
     AGTAttach(self.view);
     AGTRefresh();
+}
+
+- (void)viewDidDisappear:(BOOL)animated {
+    %orig;
+    gVisible = NO;
 }
 
 %end
@@ -338,12 +390,11 @@ static void AGTAttach(UIView *host) {
                              @"kMRMediaRemoteNowPlayingApplicationIsPlayingDidChangeNotification",
                              @"kMRMediaRemoteNowPlayingApplicationDidChangeNotification"]) {
         [nc addObserverForName:name object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
-            AGTRefresh();
+            AGTScheduleRefresh();
         }];
     }
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, AGTPrefsChanged,
                                     CFSTR(AGT_PREFS_NOTIF), NULL,
                                     CFNotificationSuspensionBehaviorDeliverImmediately);
-    AGTRefresh();
 }

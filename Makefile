@@ -12,3 +12,6 @@ aigistoaster_CFLAGS = -fobjc-arc
 aigistoaster_FRAMEWORKS = UIKit CoreImage QuartzCore
 
 include $(THEOS_MAKE_PATH)/tweak.mk
+
+SUBPROJECTS += aigistoasterprefs
+include $(THEOS_MAKE_PATH)/aggregate.mk
