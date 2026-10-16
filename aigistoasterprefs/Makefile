@@ -9,6 +9,8 @@ aigistoasterprefs_FILES = RootListController.m
 aigistoasterprefs_FRAMEWORKS = UIKit
 aigistoasterprefs_INSTALL_PATH = /Library/PreferenceBundles
 aigistoasterprefs_CFLAGS = -fobjc-arc
+# The Preferences private framework is missing from the latest SDK stubs:
+# resolve its classes at runtime (the Settings app has it loaded anyway).
 aigistoasterprefs_LDFLAGS = -undefined dynamic_lookup
 
 include $(THEOS_MAKE_PATH)/bundle.mk

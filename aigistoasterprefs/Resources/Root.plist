@@ -157,6 +157,8 @@
 		<dict>
 			<key>cell</key>
 			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>Zoom 1.0 : l'artwork tient dans la largeur de l'écran. Plus haut : il est agrandi pour remplir l'écran.</string>
 			<key>label</key>
 			<string>Blur (artwork)</string>
 		</dict>
@@ -177,6 +179,26 @@
 			<integer>100</integer>
 			<key>min</key>
 			<integer>0</integer>
+			<key>showValue</key>
+			<true/>
+		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.matth.aigistoaster/prefs</string>
+			<key>cell</key>
+			<string>PSSliderCell</string>
+			<key>default</key>
+			<real>1.0</real>
+			<key>defaults</key>
+			<string>com.matth.aigistoaster</string>
+			<key>key</key>
+			<string>blurZoom</string>
+			<key>label</key>
+			<string>Zoom de l'artwork</string>
+			<key>max</key>
+			<real>2.5</real>
+			<key>min</key>
+			<real>1.0</real>
 			<key>showValue</key>
 			<true/>
 		</dict>
