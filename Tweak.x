@@ -71,83 +71,70 @@ static UIImage *AGTDownscale(UIImage *img, CGFloat maxSide) {
     }];
 }
 
-// Rendered at a decent resolution (640px) so it is never pixelated once
-// stretched on screen. amount: 0-100 -> radius 0-12% of the image size.
-static UIImage *AGTBlur(UIImage *img, CGFloat amount) {
-    UIImage *base = AGTDownscale(img, 640);
-    CIImage *ci = [CIImage imageWithCGImage:base.CGImage];
-    if (!ci || amount <= 0.5) return base;
-    CGFloat radius = (amount / 100.0) * 0.12 * MAX(ci.extent.size.width, ci.extent.size.height);
+static CIContext *AGTCIContext(void) {
+    static CIContext *ctx;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ ctx = [CIContext contextWithOptions:nil]; });
+    return ctx;
+}
+
+// Gaussian blur with edge clamping (no dark/transparent borders)
+static UIImage *AGTBlurImage(UIImage *img, CGFloat radius) {
+    CIImage *ci = [CIImage imageWithCGImage:img.CGImage];
+    if (!ci || radius <= 0.1) return img;
     CIFilter *f = [CIFilter filterWithName:@"CIGaussianBlur"];
     [f setValue:[ci imageByClampingToExtent] forKey:kCIInputImageKey];
     [f setValue:@(radius) forKey:kCIInputRadiusKey];
     CIImage *out = [f.outputImage imageByCroppingToRect:ci.extent];
-    static CIContext *cictx;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ cictx = [CIContext contextWithOptions:nil]; });
-    CGImageRef cg = [cictx createCGImage:out fromRect:ci.extent];
-    if (!cg) return base;
+    CGImageRef cg = [AGTCIContext() createCGImage:out fromRect:ci.extent];
+    if (!cg) return img;
     UIImage *res = [UIImage imageWithCGImage:cg];
     CGImageRelease(cg);
     return res;
 }
 
+// Rendered at 640px so it is never pixelated once stretched on screen.
+// amount: 0-100 -> radius 1.2%-12% of the image size (a minimum of smoothing
+// always applies: it hides the upscaling of small artworks).
+static UIImage *AGTBlur(UIImage *img, CGFloat amount) {
+    UIImage *base = AGTDownscale(img, 640);
+    CGFloat maxSide = MAX(CGImageGetWidth(base.CGImage), CGImageGetHeight(base.CGImage));
+    CGFloat radius = MAX(0.012, (amount / 100.0) * 0.12) * maxSide;
+    return AGTBlurImage(base, radius);
+}
+
 // ---------------------------------------------------------------------------
-// Mesh: pick a few vivid, DISTINCT colors from the artwork (keeping where they
-// come from), draw big soft blobs on a dark base, once, into a small bitmap.
+// Mesh: the artwork reduced to a 6x6 grid of colors (so EVERY color of the
+// artwork is kept, at its place), a bit more saturated, then stretched to the
+// screen shape and smoothed into a soft gradient. Drawn once, into a tiny bitmap.
 // ---------------------------------------------------------------------------
 static UIImage *AGTRenderMesh(UIImage *art) {
-    enum { N = 4 };
+    enum { N = 6 };
     uint8_t px[N * N * 4];
     memset(px, 0, sizeof(px));
-    CGColorSpaceRef cs0 = CGColorSpaceCreateDeviceRGB();
-    CGContextRef bc = CGBitmapContextCreate(px, N, N, 8, N * 4, cs0,
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef bc = CGBitmapContextCreate(px, N, N, 8, N * 4, cs,
                                             kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
-    CGColorSpaceRelease(cs0);
-    if (!bc) return nil;
+    if (!bc) { CGColorSpaceRelease(cs); return nil; }
     CGContextSetInterpolationQuality(bc, kCGInterpolationHigh);
     CGContextDrawImage(bc, CGRectMake(0, 0, N, N), art.CGImage);
-    CGContextRelease(bc);
 
-    CGFloat R[N * N], G[N * N], B[N * N], score[N * N];
-    CGFloat ar = 0, ag = 0, ab = 0;
     for (int i = 0; i < N * N; i++) {
-        R[i] = px[i * 4] / 255.0;
-        G[i] = px[i * 4 + 1] / 255.0;
-        B[i] = px[i * 4 + 2] / 255.0;
-        ar += R[i]; ag += G[i]; ab += B[i];
-        CGFloat h, s, v, a;
-        [[UIColor colorWithRed:R[i] green:G[i] blue:B[i] alpha:1] getHue:&h saturation:&s brightness:&v alpha:&a];
-        score[i] = s * (0.35 + 0.65 * v) + 0.15 * v;
+        CGFloat h, s, v, a, r, g, b;
+        UIColor *c = [UIColor colorWithRed:px[i * 4] / 255.0 green:px[i * 4 + 1] / 255.0
+                                      blue:px[i * 4 + 2] / 255.0 alpha:1];
+        [c getHue:&h saturation:&s brightness:&v alpha:&a];
+        s = MIN(1.0, s * 1.4);
+        v = MIN(1.0, MAX(0.0, (v - 0.5) * 1.1 + 0.5)); // light contrast, dark areas stay dark
+        [[UIColor colorWithHue:h saturation:s brightness:v alpha:1] getRed:&r green:&g blue:&b alpha:&a];
+        px[i * 4] = (uint8_t)(r * 255);
+        px[i * 4 + 1] = (uint8_t)(g * 255);
+        px[i * 4 + 2] = (uint8_t)(b * 255);
+        px[i * 4 + 3] = 255;
     }
-    ar /= (N * N); ag /= (N * N); ab /= (N * N);
-
-    // C arrays cannot be captured by blocks: use pointers to them instead
-    const CGFloat *Rp = R, *Gp = G, *Bp = B, *scoreP = score;
-
-    NSMutableArray<NSNumber *> *order = [NSMutableArray array];
-    for (int i = 0; i < N * N; i++) [order addObject:@(i)];
-    [order sortUsingComparator:^NSComparisonResult(NSNumber *x, NSNumber *y) {
-        CGFloat a = scoreP[x.intValue], b = scoreP[y.intValue];
-        return a < b ? NSOrderedDescending : (a > b ? NSOrderedAscending : NSOrderedSame);
-    }];
-
-    NSMutableArray<NSNumber *> *picked = [NSMutableArray array];
-    for (NSNumber *n in order) {
-        int i = n.intValue;
-        BOOL distinct = YES;
-        for (NSNumber *p in picked) {
-            int j = p.intValue;
-            CGFloat d = sqrt(pow(R[i] - R[j], 2) + pow(G[i] - G[j], 2) + pow(B[i] - B[j], 2));
-            if (d < 0.28) { distinct = NO; break; }
-        }
-        if (distinct) [picked addObject:n];
-        if (picked.count >= 5) break;
-    }
-    for (NSNumber *n in order) { // monochrome artwork: complete with the next best cells
-        if (picked.count >= 4) break;
-        if (![picked containsObject:n]) [picked addObject:n];
-    }
+    CGImageRef small = CGBitmapContextCreateImage(bc);
+    CGContextRelease(bc);
+    if (!small) { CGColorSpaceRelease(cs); return nil; }
 
     CGSize size = CGSizeMake(120, 260);
     UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
@@ -155,39 +142,28 @@ static UIImage *AGTRenderMesh(UIImage *art) {
     fmt.opaque = YES;
     UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:size format:fmt];
 
-    return [r imageWithActions:^(UIGraphicsImageRendererContext *rc) {
+    UIImage *stretched = [r imageWithActions:^(UIGraphicsImageRendererContext *rc) {
         CGContextRef c = rc.CGContext;
-        CGContextSetRGBFillColor(c, ar * 0.45, ag * 0.45, ab * 0.45, 1);
-        CGContextFillRect(c, CGRectMake(0, 0, size.width, size.height));
-
-        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-        CGFloat radius = size.height * 0.62;
-        CGFloat locs[3] = {0.0, 0.5, 1.0};
-        for (NSNumber *n in picked) {
-            int i = n.intValue;
-            CGFloat h, s, v, a;
-            [[UIColor colorWithRed:Rp[i] green:Gp[i] blue:Bp[i] alpha:1] getHue:&h saturation:&s brightness:&v alpha:&a];
-            UIColor *boosted = [UIColor colorWithHue:h saturation:MIN(1.0, s * 1.35)
-                                          brightness:MAX(0.40, MIN(1.0, v * 1.1)) alpha:1];
-            CGFloat cr, cg, cb;
-            [boosted getRed:&cr green:&cg blue:&cb alpha:&a];
-            CGFloat comps[12] = {cr, cg, cb, 0.95,
-                                 cr, cg, cb, 0.45,
-                                 cr, cg, cb, 0.0};
-            CGGradientRef grad = CGGradientCreateWithColorComponents(cs, comps, locs, 3);
-            CGPoint ctr = CGPointMake(((i % N) + 0.5) / N * size.width,
-                                      ((i / N) + 0.5) / N * size.height);
-            CGContextDrawRadialGradient(c, grad, ctr, 0, ctr, radius, 0);
-            CGGradientRelease(grad);
-        }
-
-        // slightly darker towards the bottom (controls / readability)
-        CGFloat dark[8] = {0, 0, 0, 0.0, 0, 0, 0, 0.35};
-        CGGradientRef g2 = CGGradientCreateWithColorComponents(cs, dark, NULL, 2);
-        CGContextDrawLinearGradient(c, g2, CGPointMake(0, size.height * 0.45), CGPointMake(0, size.height), 0);
-        CGGradientRelease(g2);
-        CGColorSpaceRelease(cs);
+        CGContextSetInterpolationQuality(c, kCGInterpolationHigh);
+        CGContextTranslateCTM(c, 0, size.height);
+        CGContextScaleCTM(c, 1, -1);
+        CGContextDrawImage(c, CGRectMake(0, 0, size.width, size.height), small);
     }];
+    CGImageRelease(small);
+
+    UIImage *smooth = AGTBlurImage(stretched, 22); // strong smoothing on a 120px-wide canvas
+
+    UIImage *result = [r imageWithActions:^(UIGraphicsImageRendererContext *rc) {
+        CGContextRef c = rc.CGContext;
+        [smooth drawInRect:CGRectMake(0, 0, size.width, size.height)];
+        // a little darker towards the bottom (controls / readability)
+        CGFloat dark[8] = {0, 0, 0, 0.0, 0, 0, 0, 0.3};
+        CGGradientRef g2 = CGGradientCreateWithColorComponents(cs, dark, NULL, 2);
+        CGContextDrawLinearGradient(c, g2, CGPointMake(0, size.height * 0.5), CGPointMake(0, size.height), 0);
+        CGGradientRelease(g2);
+    }];
+    CGColorSpaceRelease(cs);
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -218,12 +194,15 @@ static UIImage *AGTRenderMesh(UIImage *art) {
 
         _imageView = [[UIImageView alloc] initWithFrame:self.bounds];
         _imageView.contentMode = UIViewContentModeScaleAspectFill;
+        _imageView.layer.magnificationFilter = kCAFilterLinear;
         _imageView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         _imageView.hidden = YES;
         [self addSubview:_imageView];
 
         _frontView = [[UIImageView alloc] initWithFrame:self.bounds];
         _frontView.contentMode = UIViewContentModeScaleToFill;
+        _frontView.layer.magnificationFilter = kCAFilterLinear;
+        _frontView.layer.minificationFilter = kCAFilterTrilinear;
         _frontView.hidden = YES;
         _frontView.layer.shouldRasterize = YES;
         _frontView.layer.rasterizationScale = UIScreen.mainScreen.scale;
@@ -248,14 +227,18 @@ static UIImage *AGTRenderMesh(UIImage *art) {
     UIImage *img = self.frontView.image;
     if (!img || self.bounds.size.width <= 0) return;
     CGFloat zoom = MAX(1.0, AGTFloat(@"blurZoom", 1.0));
+    CGFloat pos = MIN(100.0, MAX(0.0, AGTFloat(@"blurPosition", 50.0))) / 100.0;
     CGFloat aspect = img.size.width / MAX(1.0, img.size.height);
-    CGFloat w = self.bounds.size.width * zoom;
+    CGFloat W = self.bounds.size.width, H = self.bounds.size.height;
+    CGFloat w = W * zoom;
     CGFloat h = w / aspect;
+    CGFloat y = H * pos - h / 2; // the artwork is centered on this height of the screen
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    self.frontView.frame = CGRectMake((self.bounds.size.width - w) / 2, (self.bounds.size.height - h) / 2, w, h);
+    self.frontView.frame = CGRectMake((W - w) / 2, y, w, h);
     self.frontMask.frame = self.frontView.bounds;
-    self.frontView.layer.mask = (h >= self.bounds.size.height) ? nil : self.frontMask;
+    BOOL covers = (y <= 0.5 && y + h >= H - 0.5);
+    self.frontView.layer.mask = covers ? nil : self.frontMask;
     [CATransaction commit];
 }
 
@@ -306,11 +289,12 @@ static UIImage *AGTRenderMesh(UIImage *art) {
     CGFloat angle = AGTFloat(@"gradientAngle", 135);
     CGFloat blur = AGTFloat(@"blurAmount", 60);
     CGFloat zoom = AGTFloat(@"blurZoom", 1.0);
+    CGFloat bpos = AGTFloat(@"blurPosition", 50.0);
     BOOL anim = AGTBool(@"meshAnimated", NO);
     BOOL isGradient = [mode isEqualToString:@"gradient"];
 
-    NSString *sig = [NSString stringWithFormat:@"%@|%.2f|%@|%@|%.0f|%.0f|%.2f|%d|%lu",
-                     mode, dim, c1, c2, angle, blur, zoom, anim, (unsigned long)(isGradient ? 0 : hash)];
+    NSString *sig = [NSString stringWithFormat:@"%@|%.2f|%@|%@|%.0f|%.0f|%.2f|%.0f|%d|%lu",
+                     mode, dim, c1, c2, angle, blur, zoom, bpos, anim, (unsigned long)(isGradient ? 0 : hash)];
     if ([sig isEqualToString:self.signature]) return; // nothing changed: do no work at all
     self.signature = sig;
     self.dimView.alpha = dim;
