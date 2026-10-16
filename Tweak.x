@@ -122,10 +122,13 @@ static UIImage *AGTRenderMesh(UIImage *art) {
     }
     ar /= (N * N); ag /= (N * N); ab /= (N * N);
 
+    // C arrays cannot be captured by blocks: use pointers to them instead
+    const CGFloat *Rp = R, *Gp = G, *Bp = B, *scoreP = score;
+
     NSMutableArray<NSNumber *> *order = [NSMutableArray array];
     for (int i = 0; i < N * N; i++) [order addObject:@(i)];
     [order sortUsingComparator:^NSComparisonResult(NSNumber *x, NSNumber *y) {
-        CGFloat a = score[x.intValue], b = score[y.intValue];
+        CGFloat a = scoreP[x.intValue], b = scoreP[y.intValue];
         return a < b ? NSOrderedDescending : (a > b ? NSOrderedAscending : NSOrderedSame);
     }];
 
@@ -163,7 +166,7 @@ static UIImage *AGTRenderMesh(UIImage *art) {
         for (NSNumber *n in picked) {
             int i = n.intValue;
             CGFloat h, s, v, a;
-            [[UIColor colorWithRed:R[i] green:G[i] blue:B[i] alpha:1] getHue:&h saturation:&s brightness:&v alpha:&a];
+            [[UIColor colorWithRed:Rp[i] green:Gp[i] blue:Bp[i] alpha:1] getHue:&h saturation:&s brightness:&v alpha:&a];
             UIColor *boosted = [UIColor colorWithHue:h saturation:MIN(1.0, s * 1.35)
                                           brightness:MAX(0.40, MIN(1.0, v * 1.1)) alpha:1];
             CGFloat cr, cg, cb;
