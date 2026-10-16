@@ -1,16 +1,17 @@
 TARGET := iphone:clang:latest:15.0
 ARCHS = arm64 arm64e
+THEOS_PACKAGE_SCHEME = rootless
+INSTALL_TARGET_PROCESSES = SpringBoard
 
 include $(THEOS)/makefiles/common.mk
 
-BUNDLE_NAME = aigistoasterprefs
+TWEAK_NAME = aigistoaster
 
-aigistoasterprefs_FILES = RootListController.m
-aigistoasterprefs_FRAMEWORKS = UIKit
-aigistoasterprefs_INSTALL_PATH = /Library/PreferenceBundles
-aigistoasterprefs_CFLAGS = -fobjc-arc
-# The Preferences private framework is missing from the latest SDK stubs:
-# resolve its classes at runtime (the Settings app has it loaded anyway).
-aigistoasterprefs_LDFLAGS = -undefined dynamic_lookup
+aigistoaster_FILES = Tweak.x
+aigistoaster_CFLAGS = -fobjc-arc
+aigistoaster_FRAMEWORKS = UIKit CoreImage QuartzCore
 
-include $(THEOS_MAKE_PATH)/bundle.mk
+include $(THEOS_MAKE_PATH)/tweak.mk
+
+SUBPROJECTS += aigistoasterprefs
+include $(THEOS_MAKE_PATH)/aggregate.mk
