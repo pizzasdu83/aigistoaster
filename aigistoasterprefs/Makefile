@@ -7,8 +7,8 @@ BUNDLE_NAME = aigistoasterprefs
 
 aigistoasterprefs_FILES = RootListController.m
 aigistoasterprefs_FRAMEWORKS = UIKit
-aigistoasterprefs_PRIVATE_FRAMEWORKS = Preferences
 aigistoasterprefs_INSTALL_PATH = /Library/PreferenceBundles
 aigistoasterprefs_CFLAGS = -fobjc-arc
+aigistoasterprefs_LDFLAGS = -undefined dynamic_lookup
 
 include $(THEOS_MAKE_PATH)/bundle.mk
